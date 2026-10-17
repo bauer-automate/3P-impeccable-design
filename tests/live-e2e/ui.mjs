@@ -34,6 +34,7 @@ const DETECT_BADGE = '#impeccable-live-detect-badge';
 const DESIGN_TOGGLE = '#impeccable-live-design-toggle';
 const DESIGN_HOST = '#impeccable-live-design-host';
 const EXIT_BUTTON = '#impeccable-live-exit';
+const CONFIGURE_INPUT_ID = '#impeccable-live-input';
 const INSERT_INPUT_ID = '#impeccable-live-insert-input';
 const INSERT_CREATE_ID = '#impeccable-live-insert-create';
 const ANNOTATION_ID = '#impeccable-live-annot';
@@ -524,6 +525,28 @@ async function resetPickMode(page) {
 }
 
 /**
+ * Type the configure prompt the way a user does. The bar focuses its input
+ * after a pick, so the keys land wherever focus really is: a host focus trap
+ * that pulls focus back into its modal fails this (issue #851).
+ */
+export async function typeConfigurePrompt(page, prompt) {
+  await page.waitForFunction(
+    (sel) => {
+      const input = window.__impeccableLiveQuery(sel);
+      return Boolean(input) && window.__IMPECCABLE_LIVE_CHROME_CORE__?.activeElementDeep?.() === input;
+    },
+    CONFIGURE_INPUT_ID,
+    { timeout: 5_000 },
+  );
+  await page.keyboard.type(prompt);
+  await page.waitForFunction(
+    ({ sel, value }) => window.__impeccableLiveQuery(sel)?.value === value,
+    { sel: CONFIGURE_INPUT_ID, value: prompt },
+    { timeout: 5_000 },
+  );
+}
+
+/**
  * Set the variant count by clicking the count button (cycles 2 → 3 → 4 → 2).
  * Default is 3. If the desired count is already showing, this is a no-op.
  */
@@ -606,6 +629,35 @@ export async function clickGo(page) {
 }
 
 /**
+ * The generating shader is the visible loader: a frozen capture of the
+ * original painted over the target while variants are being written. Every
+ * transition into CYCLING has to take it down, so a cycling bar with the
+ * shader still up is the stuck loader from issue #719, not a cosmetic
+ * detail. The transition is synchronous, so a short window is generous.
+ */
+async function assertGeneratingShaderCleared(page) {
+  const stillUp = await page
+    .waitForFunction(
+      () => !(window.__impeccableLiveQuery || document.querySelector.bind(document))('#impeccable-live-shader'),
+      undefined,
+      { timeout: 5_000 },
+    )
+    .then(() => false)
+    .catch(() => true);
+  if (stillUp) {
+    const err = new Error(
+      'CYCLING reached but the generating shader overlay (#impeccable-live-shader) is still up: '
+      + 'the loader never handed off to the variant cycler',
+    );
+    // Cycling was reached, so the recovery paths in waitForCyclingRobust
+    // (retrace preActions, reload) have nothing to recover and a reload would
+    // hide the defect by taking the shader down with the page.
+    err.impeccableNoRetry = true;
+    throw err;
+  }
+}
+
+/**
  * Wait for the bar to enter CYCLING state — happens after the agent's
  * variants land in the DOM via HMR and the MutationObserver counts them.
  *
@@ -636,6 +688,7 @@ export async function waitForCycling(page, expectedCount, { timeout = 30_000 } =
     { barSel: BAR_ID, expected: expectedCount },
     { timeout },
     );
+    await assertGeneratingShaderCleared(page);
   } catch (err) {
     if (process.env.IMPECCABLE_E2E_DEBUG) {
       const snapshot = await page.evaluate((barSel) => {

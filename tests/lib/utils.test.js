@@ -162,6 +162,15 @@ describe('generateYamlFrontmatter', () => {
     expect(result).toContain('user-invocable: true');
   });
 
+  test('should generate nested metadata', () => {
+    const result = generateYamlFrontmatter({
+      name: 'test',
+      metadata: { version: '1.2.3' },
+    });
+
+    expect(result).toContain('metadata:\n  version: 1.2.3');
+  });
+
   test('should roundtrip: generate and parse back', () => {
     const original = {
       name: 'roundtrip-test',
@@ -611,10 +620,10 @@ describe('replacePlaceholders', () => {
 
   test('should replace {{ask_instruction}} with provider-specific value', () => {
     const result = replacePlaceholders('{{ask_instruction}}', 'claude-code');
-    expect(result).toBe('STOP and call the AskUserQuestion tool to clarify.');
+    expect(result).toBe('Ask with the AskUserQuestion tool and wait for the answer before continuing.');
 
     const cursorResult = replacePlaceholders('{{ask_instruction}}', 'cursor');
-    expect(cursorResult).toBe('ask the user directly to clarify what you cannot infer.');
+    expect(cursorResult).toBe('Ask the user directly to clarify what you cannot infer.');
   });
 
   test('should replace {{available_commands}} with command list', () => {
@@ -643,7 +652,7 @@ describe('replacePlaceholders', () => {
 
   test('should replace multiple placeholders in the same string', () => {
     const result = replacePlaceholders('{{model}} uses {{config_file}} and {{ask_instruction}}', 'claude-code');
-    expect(result).toBe('Claude uses CLAUDE.md and STOP and call the AskUserQuestion tool to clarify.');
+    expect(result).toBe('Claude uses CLAUDE.md and Ask with the AskUserQuestion tool and wait for the answer before continuing.');
   });
 
   test('should replace multiple occurrences of the same placeholder', () => {

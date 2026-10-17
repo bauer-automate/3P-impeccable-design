@@ -32,7 +32,7 @@ import {
   FAKE_VARIANT_FONT_WEIGHTS,
 } from './live-e2e/agent.mjs';
 import { createLlmAgent, resolveLlmAgentConfig } from './live-e2e/agents/llm-agent.mjs';
-import { bootFixtureSession, FIXTURES_DIR } from './live-e2e/session.mjs';
+import { bootFixtureSession, ENGINE_BIN, ENGINE_MISSING_MESSAGE, FIXTURES_DIR, runEngineSync } from './live-e2e/session.mjs';
 import {
   assertApplyDockVisible,
   assertApplyDockLoading,
@@ -60,6 +60,7 @@ import {
   readComputedFontWeight,
   runLiveChromeBottomBarSmoke,
   setTuneRange,
+  typeConfigurePrompt,
   waitForApplyDockHidden,
   waitForBarHidden,
   waitForComputedFontWeight,
@@ -173,6 +174,9 @@ function isBenignConsoleError(entry) {
 
 before(async () => {
   if (fixtures.length === 0) return;
+  // The whole sweep drives engine verbs; without a binary there is nothing to
+  // test, and a silent skip would read as coverage.
+  if (!ENGINE_BIN) throw new Error(ENGINE_MISSING_MESSAGE);
   try {
     playwright = await import('playwright');
   } catch (err) {
@@ -342,6 +346,8 @@ for (const { name, fixture } of fixtures) {
             });
             t.diagnostic(`Bar after pick: ${JSON.stringify(barText)}`);
           }
+
+          await typeConfigurePrompt(page, 'make it bolder');
 
           t.diagnostic('Clicking Go');
           await clickGo(page);
@@ -803,6 +809,131 @@ for (const { name, fixture } of fixtures) {
           assert.doesNotMatch(final, /var\(--p-/, 'no unbaked var(--p-*) survives accept');
         } finally {
           await teardownAndResetBrowser(session.teardown);
+        }
+      });
+    }
+
+    // -----------------------------------------------------------------
+    // Agent-initiated targeting (the `generate` command). The agent names
+    // the element over the live-generate CLI; the overlay resolves the
+    // selector, scrolls to it, enters the picked state, and fires Go with
+    // no user click. Everything downstream (generate event, variants,
+    // cycling, accept, carbonize) is the standard pipeline, so the second
+    // half of this test reuses the core helpers unchanged.
+    // -----------------------------------------------------------------
+    if (shouldRunScenario('agent-target') && fixture.runtime.agentTargetScenario) {
+      it('agent-initiated target scrolls, picks, and generates without a user click', liveE2eTestOptions, async (t) => {
+        if (!canRunFakeAgentScenario(t)) return;
+        const scenario = fixture.runtime.agentTargetScenario;
+        const session = await bootFixtureSession({
+          name,
+          fixture,
+          browser,
+          agent: createFakeAgent(),
+          wrapTarget: wrapTargetFromPickedElement,
+          atomicDelayMs,
+          log: (m) => t.diagnostic(m),
+        });
+        const { page, appRoot, teardown } = session;
+        try {
+          await waitForHandshake(page);
+
+          // Failure contracts first; none of these may start a session.
+          const miss = runLiveGenerate(appRoot, { selector: scenario.missSelector, action: scenario.action });
+          assert.equal(miss.ok, false);
+          assert.equal(miss.error, 'no_match');
+
+          const ambiguous = runLiveGenerate(appRoot, { selector: scenario.ambiguousSelector, action: scenario.action });
+          assert.equal(ambiguous.ok, false);
+          assert.equal(ambiguous.error, 'ambiguous');
+          assert.ok(ambiguous.matchCount >= 2, 'ambiguous reports the match count');
+          assert.ok(
+            Array.isArray(ambiguous.candidates) && ambiguous.candidates.length >= 2,
+            'ambiguous lists candidate descriptors',
+          );
+
+          const dry = runLiveGenerate(appRoot, {
+            selector: scenario.selector,
+            action: scenario.action,
+            'dry-run': true,
+          });
+          assert.equal(dry.ok, true, `dry-run resolved: ${JSON.stringify(dry)}`);
+          assert.equal(dry.dryRun, true);
+          assert.equal(dry.matchCount, 1);
+
+          const noSession = await page.evaluate(() => window.__IMPECCABLE_LIVE_CHROME_CORE__.debugState());
+          assert.equal(noSession.currentSessionId, null, 'failed and dry-run targets start no session');
+          assert.equal(await page.evaluate(() => Math.round(window.scrollY)), 0, 'page has not scrolled yet');
+
+          // The happy path: resolve, scroll, pick, Go.
+          t.diagnostic(`Agent-targeting ${scenario.selector} (${scenario.action} x${scenario.count || 3})`);
+          const res = runLiveGenerate(appRoot, {
+            selector: scenario.selector,
+            action: scenario.action,
+            count: scenario.count || 3,
+            ...(scenario.prompt ? { prompt: scenario.prompt } : {}),
+          });
+          assert.equal(res.ok, true, `live-generate succeeded: ${JSON.stringify(res)}`);
+          assert.match(res.sessionId, /^[0-9a-f]{8}$/, 'a session id came back');
+          assert.equal(res.action, scenario.action);
+
+          const scrolled = await page.evaluate(() => Math.round(window.scrollY));
+          assert.ok(
+            scrolled >= (scenario.minScrollY || 100),
+            `browser scrolled to the target (scrollY=${scrolled})`,
+          );
+          const dbg = await page.evaluate(() => window.__IMPECCABLE_LIVE_CHROME_CORE__.debugState());
+          assert.equal(dbg.currentSessionId, res.sessionId, 'overlay session matches the CLI result');
+
+          if (scenario.prompt) {
+            // The configure bar rebuild once discarded the preset prompt, so
+            // pin the regression at the wire: the journaled generate event
+            // must carry the prompt the CLI was given. The engine journals a
+            // generate event when the agent leases it from /poll, so wait
+            // for the entry instead of reading the journal right away.
+            const [journaled] = await waitForJournalEvent(appRoot, res.sessionId, 'generate');
+            const generateEvent = journaled?.event ?? journaled;
+            assert.equal(
+              generateEvent?.freeformPrompt,
+              scenario.prompt,
+              'the prompt reached the generate event',
+            );
+          }
+
+          // A second target while the session is mid-flight must refuse.
+          const busy = runLiveGenerate(appRoot, { selector: scenario.selector, action: scenario.action });
+          assert.equal(busy.ok, false);
+          assert.equal(busy.error, 'busy');
+
+          await waitForCyclingRobust(page, 3, { agentMode: 'fake', log: (m) => t.diagnostic(m) });
+          const sourceFile = await locateSessionFile(appRoot);
+          assert.ok(sourceFile, 'the variants wrapper landed in a source file');
+
+          await cycleToVariant(page, 2, 3);
+          t.diagnostic('Accepting variant 2');
+          await clickAccept(page, { expectedVariant: 2 });
+          await waitForBarHidden(page);
+          const final = await waitForSourceClean(sourceFile, 20_000, {});
+          assert.match(
+            final,
+            new RegExp(fixture.runtime.acceptedSourcePattern),
+            'accepted source element survives',
+          );
+          for (const needle of fixture.runtime.assertSourceContains || []) {
+            assert.ok(final.includes(needle), `source still contains ${JSON.stringify(needle)} after accept`);
+          }
+          assert.doesNotMatch(final, /data-impeccable-variants="/, 'variants wrapper removed');
+          assert.doesNotMatch(final, /impeccable-carbonize-start/, 'carbonize block rewritten');
+
+          // The overlay is reusable after accept: a fresh dry-run resolves.
+          const post = runLiveGenerate(appRoot, {
+            selector: scenario.selector,
+            action: scenario.action,
+            'dry-run': true,
+          });
+          assert.equal(post.ok, true, 'a new target resolves after accept');
+        } finally {
+          await teardownAndResetBrowser(teardown);
         }
       });
     }
@@ -1280,17 +1411,21 @@ for (const { name, fixture } of fixtures) {
         const pickSelector = annotation.selector || fixture.runtime.pickSelector || 'h1.hero-title';
         try {
           await waitForHandshake(page);
+          if (annotation.uploadDelayMs) {
+            await page.route('**/annotation?*', async (route) => {
+              await new Promise(resolve => setTimeout(resolve, annotation.uploadDelayMs));
+              await route.continue();
+            });
+          }
           if (fixture.runtime.preActions) await runPreActions(page, fixture.runtime.preActions);
           await pickElement(page, pickSelector, { resetPickMode: true });
           await drawAnnotationPinAndStroke(page, {
             comment: annotation.comment || 'Make this selected element easier to scan',
           });
           await clickGo(page);
-          await waitForCyclingRobust(page, 3, {
-            agentMode,
-            preActions: fixture.runtime.preActions,
-            log: (m) => t.diagnostic(m),
-          });
+          // A reload would mask a checkpoint-before-creation race by adopting
+          // the session again. Annotated generation must complete in this tab.
+          await waitForCycling(page, 3, { timeout: agentMode === 'llm' ? 180_000 : 30_000 });
 
           const generateEvent = recordedGenerateEvents.at(-1);
           await assertAnnotationUploadEvent(generateEvent);
@@ -1299,7 +1434,7 @@ for (const { name, fixture } of fixtures) {
 
           const sourceFile = await locateSessionFile(session.appRoot);
           const svelteComponentTarget = svelteComponentTargetFor(sourceFile);
-          await clickNext(page);
+          await cycleToVariant(page, 2, 3);
           assert.equal(await getVisibleVariant(page), 2, 'variant 2 visible after annotated generate');
           await clickAccept(page, { expectedVariant: 2 });
           await waitForBarHidden(page);
@@ -1354,6 +1489,29 @@ function canRunFakeAgentScenario(t) {
     return false;
   }
   return true;
+}
+
+/**
+ * Run the live-generate verb (agent-initiated targeting) against a staged
+ * fixture and parse its JSON verdict. The CLI exits 1 for every ok:false
+ * outcome, so the JSON is read from the thrown error's stdout in that case.
+ */
+function runLiveGenerate(appRoot, flags) {
+  const args = [];
+  for (const [key, value] of Object.entries(flags)) {
+    if (value === true) args.push(`--${key}`);
+    else if (value !== undefined && value !== null) args.push(`--${key}`, String(value));
+  }
+  let stdout;
+  try {
+    stdout = runEngineSync('live-generate', args, { cwd: appRoot });
+  } catch (err) {
+    // The verb exits non-zero on every failure verdict but still prints the
+    // JSON the scenario asserts on.
+    stdout = err.stdout || '';
+    if (!stdout.trim()) throw err;
+  }
+  return JSON.parse(stdout);
 }
 
 /**
@@ -1685,11 +1843,10 @@ function maybeWrapMalformedAckProbe(agent, scenario, probeState, t) {
       probeState.applyCalls = (probeState.applyCalls || 0) + 1;
       const sourceFile = firstExpectedSourceFile(scenario) || 'src/App.jsx';
       try {
-        execFileSync(
-          process.execPath,
-          [join(context.scriptsDir, 'live-poll.mjs'), '--reply', 'done', '--file', sourceFile],
-          { cwd: context.tmp, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
-        );
+        runEngineSync('live-poll', ['--reply', 'done', '--file', sourceFile], {
+          cwd: context.tmp,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
         assert.fail('malformed manual Apply ack unexpectedly succeeded');
       } catch (err) {
         const output = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n');

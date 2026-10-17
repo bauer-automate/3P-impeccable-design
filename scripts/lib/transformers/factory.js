@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 import {
   cleanDir,
@@ -184,11 +185,14 @@ function buildCursorAgent(agent, body) {
  * here, so all three resolve provider blocks, {{placeholders}}, rule markers,
  * and {{scripts_path}} the same way. The nested Codex .toml used to skip the
  * last two and shipped `node {{scripts_path}}/embed-prompt.mjs` literally.
+ * {{reference_path}} is the skill's reference/ dir relative to emitDir: a
+ * markdown link resolves against its own file, and each surface lands elsewhere.
  */
-function renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath }) {
+function renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath, emitDir, skillDir }) {
   let body = compileProviderBlocks(agent.body, providerTags);
   body = replacePlaceholders(body, placeholderKey, [], allSkillNames);
   body = stripRuleMarkers(body);
+  body = body.replace(/\{\{reference_path\}\}/g, path.relative(emitDir, path.join(skillDir, 'reference')).split(path.sep).join('/'));
   return body.replace(/\{\{scripts_path\}\}/g, scriptsPath);
 }
 
@@ -241,6 +245,7 @@ export function createTransformer(config) {
     providerTags = [provider],
     writeOpenAIMetadata = false,
     includeVersion = true,
+    versionInMetadata = false,
   } = config;
   const placeholderKey = placeholderProvider || provider;
 
@@ -274,12 +279,21 @@ export function createTransformer(config) {
         name: skillName,
         description: skill.description,
       };
-      if (skillsVersion && includeVersion) frontmatterObj.version = skillsVersion;
+      if (skillsVersion && includeVersion && !versionInMetadata) {
+        frontmatterObj.version = skillsVersion;
+      }
 
       for (const spec of activeFields) {
         if (spec.condition && !spec.condition(skill)) continue;
         const val = spec.value ? spec.value(skill) : skill[spec.sourceKey];
         if (val) frontmatterObj[spec.yamlKey] = val;
+      }
+
+      if (skillsVersion && includeVersion && versionInMetadata) {
+        frontmatterObj.metadata = {
+          ...(frontmatterObj.metadata || {}),
+          version: skillsVersion,
+        };
       }
 
       // Replace {{command_hint}} in argument-hint with command names from metadata,
@@ -346,7 +360,7 @@ export function createTransformer(config) {
         ensureDir(degradedDir);
         for (const agent of skill.agents) {
           const role = agent.name.replace(/^impeccable-/, '');
-          const body = renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath });
+          const body = renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath, emitDir: degradedDir, skillDir });
           const content = `${DEGRADED_PREAMBLE}\n\n${body.replace(/^\s+/, '')}`;
           writeFile(path.join(degradedDir, `${role}.md`), content);
           refCount++;
@@ -359,7 +373,12 @@ export function createTransformer(config) {
         ensureDir(scriptsOutDir);
         for (const script of skill.scripts) {
           const scriptContent = replaceScriptProviderMarker(script.content, placeholderKey, provider);
-          writeFile(path.join(scriptsOutDir, script.name), scriptContent);
+          const outPath = path.join(scriptsOutDir, script.name);
+          writeFile(outPath, scriptContent);
+          // The launcher must stay executable in every provider copy; a
+          // plain write would drop the bit and `impeccable context` would
+          // fail with EACCES on the first session.
+          if (script.mode) fs.chmodSync(outPath, script.mode);
           scriptCount++;
         }
       }
@@ -371,11 +390,33 @@ export function createTransformer(config) {
       if (CODEX_SKILL_PROVIDERS.has(provider)) {
         for (const agent of skill.agents || []) {
           if (agent.providers && !agent.providers.includes('codex')) continue;
-          const agentBody = renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath });
+          const agentBody = renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath, emitDir: path.join(skillDir, 'agents'), skillDir });
           const filename = `${agent.codexName || agent.name.replace(/-/g, '_')}.toml`;
           ensureDir(path.join(skillDir, 'agents'));
           writeFile(path.join(skillDir, 'agents', filename), buildCodexAgent(agent, agentBody));
         }
+      }
+    }
+
+    // Ship an explicit slash-command surface for OpenCode. OpenCode registers
+    // skill commands natively but its TUI autocomplete hides them by deliberate
+    // design (anomalyco/opencode#25439); this file also pins execution policy
+    // (agent: build, subtask: true) and routes through OpenCode's skill tool,
+    // which resolves the skill base dir for any install scope. Menu visibility
+    // is the only part contingent on OpenCode's design; the rest is intentional.
+    // Schema restricted to what OpenCode recognises (description, agent, model,
+    // variant, subtask).
+    if (provider === 'opencode' && skills.length > 0) {
+      const commandsDir = path.join(providerDir, `${configDir}/commands`);
+      ensureDir(commandsDir);
+      for (const skill of skills) {
+        const bridgeBody = `Call skill({ name: "${skill.name}" }) and follow its \`Setup\` and \`Commands\` sections to handle $ARGUMENTS.\n`;
+        const bridgeFrontmatter = generateYamlFrontmatter({
+          description: skill.description,
+          agent: 'build',
+          subtask: true,
+        });
+        writeFile(path.join(commandsDir, `${skill.name}.md`), `${bridgeFrontmatter}\n${bridgeBody}`.replace(/\n+$/, '\n'));
       }
     }
 
@@ -387,7 +428,7 @@ export function createTransformer(config) {
           // Agents can declare `providers: <list>` to limit which harnesses
           // they emit to. Default (no field) ships everywhere with agentFormat.
           if (agent.providers && !agent.providers.includes(provider)) continue;
-          const body = renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath });
+          const body = renderAgentBody(agent, { providerTags, placeholderKey, allSkillNames, scriptsPath, emitDir: agentsDir, skillDir: path.join(skillsDir, skill.name) });
           const agentFile = buildAgentFile(config, agent, body);
           if (!agentFile) continue;
           ensureDir(agentsDir);

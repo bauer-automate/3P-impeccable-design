@@ -25,17 +25,43 @@ import fs from 'fs';
 import path from 'path';
 
 /**
- * Pull the `version:` value out of a SKILL.md leading frontmatter block.
+ * Pull the version value out of a SKILL.md leading frontmatter block.
  * CRLF-tolerant (`\r?\n`) to match the shared parseFrontmatter in
  * scripts/lib/utils.js — a bundle saved with CRLF line endings must not read
- * as a null version and trip a false mismatch. `(.+)` stops at the line
- * terminator (so a trailing `\r` is excluded), and `.trim()` mops up the rest.
+ * as a null version and trip a false mismatch. Codex builds carry the version
+ * under `metadata.version`; legacy provider builds keep the top-level key.
  */
 export function readSkillFrontmatterVersion(content) {
-  const fm = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  const fm = String(content).match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n---(?:[ \t]*\r?\n|[ \t]*$)/);
   if (!fm) return null;
-  const line = fm[1].match(/^version:\s*(.+)/m);
-  return line ? line[1].trim().replace(/^['"]|['"]$/g, '') : null;
+
+  let metadataVersion = null;
+  let topLevelVersion = null;
+  let inMetadata = false;
+  let metadataIndent = null;
+
+  for (const line of fm[1].split(/\r?\n/)) {
+    if (!line.trim() || line.trimStart().startsWith('#')) continue;
+    const indentText = line.match(/^[ \t]*/)[0];
+    const indent = indentText.replace(/\t/g, '  ').length;
+
+    if (indent === 0) {
+      inMetadata = /^metadata:\s*(?:#.*)?$/.test(line);
+      metadataIndent = null;
+      const version = line.match(/^version:\s*(.+?)\s*$/);
+      if (version) topLevelVersion = version[1];
+      continue;
+    }
+
+    if (!inMetadata) continue;
+    if (metadataIndent === null) metadataIndent = indent;
+    if (indent !== metadataIndent) continue;
+    const version = line.trim().match(/^version:\s*(.+?)\s*$/);
+    if (version) metadataVersion = version[1];
+  }
+
+  const value = metadataVersion || topLevelVersion;
+  return value ? value.trim().replace(/^(["'])(.*)\1$/, '$2') : null;
 }
 
 /**
@@ -74,6 +100,9 @@ function extractFromFile(absPath, extract) {
  *   A present-but-malformed root, or one missing its `version` field, instead
  *   reports an entry in `errors` so the build fails loudly rather than passing.
  */
+// A reader returns SKIP when the file is not the artifact it checks.
+const SKIP = Symbol('skip');
+
 export function collectPluginVersions(rootDir) {
   const rootRel = '.claude-plugin/plugin.json';
   const rootManifestPath = path.join(rootDir, rootRel);
@@ -91,6 +120,19 @@ export function collectPluginVersions(rootDir) {
 
   const checks = [
     {
+      // The npm CLI shares the skill's version: one number for users to read
+      // off npm, the plugin and the changelog. Only this repo's package.json is
+      // the CLI, and it is the one that pins the engine's platform packages:
+      // impeccable-site builds the skill from a tree whose root package.json is
+      // the site's own, also named impeccable, at its own version.
+      relPath: 'package.json',
+      read: (raw) => {
+        const pkg = JSON.parse(raw);
+        const isCli = Object.keys(pkg.optionalDependencies || {}).some((k) => k.startsWith('@impeccable/cli-'));
+        return isCli ? pkg.version : SKIP;
+      },
+    },
+    {
       relPath: '.claude-plugin/marketplace.json',
       read: (raw) => JSON.parse(raw).plugins?.[0]?.version,
     },
@@ -102,6 +144,10 @@ export function collectPluginVersions(rootDir) {
       relPath: 'dist/openai/impeccable/.codex-plugin/plugin.json',
       read: (raw) => JSON.parse(raw).version,
     },
+    ...['cursor-plugin', 'dist/cursor-plugin'].flatMap((prefix) => [
+      { relPath: `${prefix}/.cursor-plugin/plugin.json`, read: (raw) => JSON.parse(raw).version },
+      { relPath: `${prefix}/skills/impeccable/SKILL.md`, read: readSkillFrontmatterVersion },
+    ]),
     {
       relPath: 'plugin/skills/impeccable/SKILL.md',
       read: (raw) => readSkillFrontmatterVersion(raw),
@@ -120,6 +166,7 @@ export function collectPluginVersions(rootDir) {
       continue;
     }
     const found = result.value;
+    if (found === SKIP) continue;
     checked.push({ relPath, found });
     if (found !== source) mismatches.push({ relPath, found, expected: source });
   }
