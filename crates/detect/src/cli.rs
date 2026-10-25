@@ -15,12 +15,20 @@ use crate::config::{
 };
 use crate::design_system::{load_design_system_for_target, DesignSystemCache};
 use crate::detect_text::{detect_text, ext_from_file_path, TextOptions};
+use crate::project_tokens::{may_need_tokens, ProjectTokens};
 use crate::engines::{EngineError, Engines, ScanOptions};
 use crate::file_system::{
     build_import_graph_reporting, detect_framework_config, is_port_listening, uses_html_engine,
     walk_dir_reporting,
 };
+use crate::github_annotations::{
+    format_github_annotations, GITHUB_JSON_CONFLICT, GITHUB_LIST_RULES_CONFLICT,
+};
 use crate::jsp;
+use crate::list_rules::{
+    collect_catalog_rules, format_list_rules_ids, format_list_rules_json, format_list_rules_text,
+    LIST_RULES_SCAN_ERROR,
+};
 use crate::util::{exists, re, D};
 
 pub const USAGE: &str = "Usage: impeccable detect [options] [file-or-dir-or-url...]
@@ -30,6 +38,10 @@ Scan files or URLs for UI anti-patterns and design quality issues.
 Options:
   --json              Output results as JSON
   --quiet             In text mode, only print the final findings count
+  --github            Write GitHub Actions annotations for each
+                      finding. Not with --json or --list-rules
+  --list-rules        Print the detector rule catalog and exit. --json
+                      for JSON, --quiet for ids only. Takes no targets
   --scope <name>      Only report rules in the given design domain
                       (type, layout). Comma-separated.
   --viewport <WxH>    Browser viewport for URL scans (default 1280x800),
@@ -62,6 +74,8 @@ Advisory findings:
 Output streams:
   Human-readable findings go to stderr so stdout stays available for structured
   output. Use --json for JSON on stdout, or redirect text with 2> findings.txt.
+  --github writes Actions annotations to stdout (no human findings).
+  --list-rules writes the catalog to stdout (no scan).
 
 Exit status:
   0  Scan completed with no primary findings (advisories may still be listed)
@@ -96,6 +110,8 @@ Examples:
   impeccable detect https://example.com
   impeccable detect --cdp 9222 --target \"My App\" --json
   impeccable detect --json .
+  impeccable detect --github src/
+  impeccable detect --list-rules
   impeccable detect --no-config src/
 ";
 
@@ -278,6 +294,7 @@ struct Ctx<'a> {
     config: DetectionConfig,
     json_mode: bool,
     quiet_mode: bool,
+    github_mode: bool,
     design_system_enabled: bool,
     base: ScanOptions,
     cache: DesignSystemCache,
@@ -297,6 +314,9 @@ struct Ctx<'a> {
     /// target (a DESIGN.md that declares a purple), and per URL scan note (a
     /// consent banner the engine hid), in first-seen order.
     design_notes: Vec<String>,
+    /// Custom properties per project, read once for the stripe colours a
+    /// component takes from a token sheet elsewhere.
+    tokens: ProjectTokens,
 }
 
 impl<'a> Ctx<'a> {
@@ -362,6 +382,7 @@ impl<'a> Ctx<'a> {
         };
         self.regex_only_files += 1;
         self.regex_only_exts.insert(ext_from_file_path(file_path));
+        let tokens = may_need_tokens(&content).then(|| self.tokens.for_file(file_path));
         Ok(detect_text(
             &content,
             file_path,
@@ -370,6 +391,7 @@ impl<'a> Ctx<'a> {
                 design_system: options.design_system.as_deref(),
                 inline_ignores: options.inline_ignores,
                 rule_pack: options.rule_pack,
+                tokens: tokens.as_deref(),
             },
         ))
     }
@@ -400,6 +422,7 @@ impl<'a> Ctx<'a> {
                 design_system: opts.design_system.as_deref(),
                 inline_ignores: opts.inline_ignores,
                 rule_pack: opts.rule_pack,
+                tokens: None,
             },
         ))
     }
@@ -482,6 +505,7 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
     let has = |args: &[String], flag: &str| args.iter().any(|a| a == flag);
     let json_mode = has(&args, "--json");
     let quiet_mode = has(&args, "--quiet");
+    let github_mode = has(&args, "--github");
     let help_mode = has(&args, "--help");
     let no_advisory = has(&args, "--no-advisory");
     if has(&args, "--fast") {
@@ -618,6 +642,10 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
         keep_consent_banners: has(&args, "--no-consent-hiding"),
         keep_overlays: has(&args, "--no-overlay-hiding"),
         unreported_rules: unreported_rules(&detection_config.ignore_rules, &scopes),
+        ignored_linked_stylesheet: Some({
+            let (cwd, config) = (cwd.clone(), detection_config.clone());
+            std::rc::Rc::new(move |path: &str| should_ignore_detection_file(path, &cwd, &config))
+        }),
     };
     let targets: Vec<String> = expand_joined_url_targets(
         args.iter()
@@ -629,6 +657,29 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
     if help_mode {
         io.out(USAGE);
         return Ok(0);
+    }
+    if has(&args, "--list-rules") {
+        if github_mode {
+            io.err(GITHUB_LIST_RULES_CONFLICT);
+            return Err(Exit(1));
+        }
+        if cdp.is_some() || !targets.is_empty() {
+            io.err(LIST_RULES_SCAN_ERROR);
+            return Err(Exit(1));
+        }
+        let rules = collect_catalog_rules(&scopes, no_advisory);
+        if json_mode {
+            io.out(&format!("{}\n", format_list_rules_json(&rules)));
+        } else if quiet_mode {
+            io.out(&format_list_rules_ids(&rules));
+        } else {
+            io.out(&format_list_rules_text(&rules));
+        }
+        return Ok(0);
+    }
+    if github_mode && json_mode {
+        io.err(GITHUB_JSON_CONFLICT);
+        return Err(Exit(1));
     }
     if cdp.is_some() && !targets.is_empty() {
         io.err("Error: --cdp scans the page of a running app and takes no file or URL targets\n");
@@ -649,6 +700,7 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
         config: detection_config,
         json_mode,
         quiet_mode,
+        github_mode,
         design_system_enabled,
         base,
         cache: DesignSystemCache::new(),
@@ -658,6 +710,7 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
         regex_only_exts: BTreeSet::new(),
         dev_server_ports: BTreeSet::new(),
         design_notes: Vec::new(),
+        tokens: ProjectTokens::default(),
     };
 
     let mut all: Vec<Finding> = Vec::new();
@@ -682,7 +735,7 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
                     // notes say which checks did not run (a hidden window skips
                     // the pixel reads), so they go to stderr there and stdout
                     // stays the JSON.
-                    if ctx.json_mode {
+                    if ctx.json_mode || ctx.github_mode {
                         ctx.io.err(&format!("{note}\n"));
                     } else if !ctx.design_notes.contains(&note) {
                         ctx.design_notes.push(note);
@@ -734,7 +787,7 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
             s.close();
         }
         result?;
-        if !json_mode && !quiet_mode && ctx.regex_only_files > 0 {
+        if !json_mode && !quiet_mode && !github_mode && ctx.regex_only_files > 0 {
             let note = regex_only_note(ctx.regex_only_files, &ctx.regex_only_exts, &ctx.dev_server_ports);
             ctx.io.err(&note);
         }
@@ -762,6 +815,12 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
         if json_mode {
             let text = format_findings(&all, true, stderr_tty);
             ctx.io.out(&format!("{text}\n"));
+        } else if github_mode {
+            let workspace = ctx.io.env("GITHUB_WORKSPACE");
+            let text = format_github_annotations(&all, &ctx.cwd, workspace);
+            if !text.is_empty() {
+                ctx.io.out(&text);
+            }
         } else if quiet_mode {
             ctx.io
                 .err(&format!("{}\n", format_finding_summary(primary_len)));
@@ -784,7 +843,7 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
     }
     if json_mode {
         ctx.io.out("[]\n");
-    } else if !quiet_mode {
+    } else if !github_mode && !quiet_mode {
         print_design_notes(&mut ctx, false);
     }
     Ok(exit_code)
@@ -941,7 +1000,7 @@ fn scan_targets(
             continue;
         };
         if stat.is_dir() {
-            if !ctx.json_mode && !ctx.quiet_mode {
+            if !ctx.json_mode && !ctx.quiet_mode && !ctx.github_mode {
                 if let Some(fw) = detect_framework_config(&resolved) {
                     ctx.dev_server_ports.insert(fw.port);
                     let probe = is_port_listening(fw.port, Some(fw.fingerprint));
@@ -986,7 +1045,7 @@ fn scan_targets(
                 .iter()
                 .filter(|f| uses_html_engine(f, &ctx.config.extensions))
                 .count();
-            if files.len() > 50 && ctx.stdin_tty && !ctx.json_mode && !ctx.quiet_mode {
+            if files.len() > 50 && ctx.stdin_tty && !ctx.json_mode && !ctx.quiet_mode && !ctx.github_mode {
                 ctx.io.err(&format!(
                     "\nFound {} files ({} HTML) in {}.\nScanning may take a while{}.\nTarget a specific subdirectory to narrow scope.\n",
                     files.len(),
