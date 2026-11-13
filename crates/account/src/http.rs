@@ -50,7 +50,13 @@ impl std::fmt::Display for ApiError {
 pub struct Client {
     agent: ureq::Agent,
     origin: String,
+    // Bauer hardening: only a loopback account service is ever contacted.
+    loopback: bool,
 }
+
+/// Shown when anything tries to reach a remote account service.
+pub const DISABLED: &str =
+    "the Impeccable account service is disabled in this build (Bauer hardened engine, see SYNC.md)";
 
 /// Largest JSON answer read from the service.
 const MAX_JSON: u64 = 1024 * 1024;
@@ -87,10 +93,16 @@ impl Client {
         Client {
             agent,
             origin: account.issuer.clone(),
+            loopback: account.is_loopback(),
         }
     }
 
     fn checked(&self, url: &str) -> Result<(), ApiError> {
+        // Bauer hardening (see SYNC.md): login, uploads and Pro dispatch all
+        // go through this client, so refusing non-loopback hosts disables them.
+        if !self.loopback {
+            return Err(ApiError::Network(DISABLED.into()));
+        }
         if config::on_origin(url, &self.origin) {
             Ok(())
         } else {
@@ -314,6 +326,23 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "refused a request outside the account service"
+        );
+    }
+
+    #[test]
+    fn a_remote_account_service_is_never_contacted() {
+        let account = Account {
+            issuer: "https://api.impeccable.style".into(),
+            home: std::env::temp_dir(),
+        };
+        let client = Client::new(&account);
+        let err = client
+            .post_json("https://api.impeccable.style/v1/x", "t", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(err.to_string(), DISABLED);
+        assert_eq!(
+            client.get_json("https://api.impeccable.style/", None).unwrap_err().to_string(),
+            DISABLED
         );
     }
 }
